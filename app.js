@@ -6,7 +6,8 @@ let FILTRO_DIA = 'todas';
 let CAL_MONTH = new Date();
 let CAL_SEL = null;
 let INSTALL_PROMPT = null;
-let HIST_ESTADO = 'todas';
+// --- NUEVO: estado del historial (Fase 1) ---
+let HIST_ESTADO = 'todas';   // todas | pendientes | en_proceso | atendidas | canceladas | vencidas
 let HIST_TIPO = 'todos';
 let HIST_BUSCAR = '';
 
@@ -24,7 +25,8 @@ const ALARM_OPTS = [
 const ALARM_TIMERS = new Map();
 let NOTIF_PERM = (typeof Notification !== 'undefined') ? Notification.permission : 'denied';
 
-const $ = s => document.querySelector(s); const $$ = s => [...document.querySelectorAll(s)];
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
 const esc = v => String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 const icon = (n,c='') => `<svg class="i ${c}" aria-hidden="true"><use href="#i-${n}"/></svg>`;
 
@@ -48,7 +50,9 @@ const alarmLabel = min => {
 function parseFechaHora(fecha, hora) {
   if (!fecha) return null;
   const h = (hora && /^\d{2}:\d{2}$/.test(hora)) ? hora : '09:00';
+  // Interpretar en zona America/Lima
   const iso = fecha + 'T' + h + ':00';
+  // Crear Date en local y ajustar si el navegador no está en Lima (aproximación robusta)
   const d = new Date(iso);
   if (isNaN(d.getTime())) return null;
   return d;
@@ -95,17 +99,19 @@ function scheduleOneAlarm(item, kind) {
   if (!when) return;
   const now = Date.now();
   const delay = when.getTime() - now;
-  if (delay < -60000) return;
+  if (delay < -60000) return; // ya pasó hace más de 1 min
   const key = kind + ':' + item.id;
   if (ALARM_TIMERS.has(key)) {
     clearTimeout(ALARM_TIMERS.get(key));
     ALARM_TIMERS.delete(key);
   }
+  // Si ya debería sonar (hasta 1 min de retraso), disparar ya
   const fire = () => dispararAlarma(item, kind);
   if (delay <= 0) {
     setTimeout(fire, 400);
     return;
   }
+  // setTimeout max ~24.8 días; para alarmas lejanas solo programamos si < 12h
   if (delay > 12 * 60 * 60 * 1000) return;
   const tid = setTimeout(fire, delay);
   ALARM_TIMERS.set(key, tid);
@@ -126,6 +132,7 @@ async function dispararAlarma(item, kind) {
     : (item.titulo || 'Actividad programada');
   const tag = 'alarm-' + kind + '-' + item.id;
 
+  // Preferir Service Worker (más fiable en Android)
   if (navigator.serviceWorker && navigator.serviceWorker.controller) {
     navigator.serviceWorker.controller.postMessage({
       type: 'SHOW_ALARM',
@@ -139,7 +146,7 @@ async function dispararAlarma(item, kind) {
     try {
       new Notification(title, {
         body,
-        icon: './icons/icon-192.png',
+        icon: '/icons/icon-192.png',
         tag,
         renotify: true,
         requireInteraction: true,
@@ -148,6 +155,7 @@ async function dispararAlarma(item, kind) {
       });
     } catch (_) {}
   }
+  // Feedback in-app
   say(kind === 'nota' ? 'Recordatorio de nota' : '¡Alarma: ' + (item.titulo || '') );
 }
 
@@ -158,6 +166,7 @@ function handleSWMessage(e) {
     const list = kind === 'nota' ? DB.notas : DB.tareas;
     const item = (list || []).find(x => String(x.id) === String(id));
     if (!item) return;
+    // Reprogramar +10 min desde ahora
     const key = kind + ':' + id;
     if (ALARM_TIMERS.has(key)) clearTimeout(ALARM_TIMERS.get(key));
     const tid = setTimeout(() => dispararAlarma(item, kind), 10 * 60 * 1000);
@@ -198,11 +207,11 @@ async function api(action, params={}) {
       res = await fetch(SCRIPT_URL, { method:'POST', redirect:'follow', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify(body), signal: ctrl.signal });
     } catch(e) {
       if (e.name==='AbortError') throw e;
-      throw new Error('No se pudo contactar al servidor.');
+      throw new Error('No se pudo contactar al servidor. Revisa que el Web App esté publicado para "Cualquier persona".');
     }
     const txt = await res.text();
     let json;
-    try { json = JSON.parse(txt); } catch { throw new Error('Respuesta inválida del Web App.'); }
+    try { json = JSON.parse(txt); } catch { throw new Error('Respuesta inválida: el Web App no es público o la URL es incorrecta.'); }
     if (!json.ok) throw new Error(json.error || 'Error servidor');
     return json.data;
   } catch(e) {
@@ -263,13 +272,14 @@ function render() {
   wireMainEvents();
 }
 
+// --- Refactor: wiring de acciones de tarjeta reutilizable (main + modal) ---
 function wireCardActions(root) {
   root.querySelectorAll('[data-check]').forEach(btn=>btn.addEventListener('click',e=>{
     e.stopPropagation();
     const t=DB.tareas.find(x=>String(x.id)===String(btn.dataset.check));
     if(!t)return;
     const n=t.estado==='atendido'?'pendiente':'atendido';
-    cerrarModal();
+    cerrarModal(); // no-op si no hay modal abierto
     act('setEstadoTarea',{id:t.id,estado:n},ESTADO_LABEL[n],()=>{t.estado=n});
   }));
   root.querySelectorAll('[data-edit]').forEach(btn=>btn.addEventListener('click',e=>{
@@ -290,13 +300,18 @@ function wireCardActions(root) {
 }
 
 function wireMainEvents() {
-  wireCardActions($('#main')); $$('#main [data-retry]').forEach(b=>b.addEventListener('click',()=>{LOAD_ERR='';render();load()}));
-  $$('#main [data-chip]').forEach(c=>c.addEventListener('click',()=>{FILTRO_DIA=c.dataset.chip;render()})); $$
-('#main [data-go]').forEach(b=>b.addEventListener('click',()=>go(b.dataset.go)));
-  $$('#main [data-cal-mes]').forEach(b=>b.addEventListener('click',()=>{ CAL_MONTH=new Date(CAL_MONTH.getFullYear(),CAL_MONTH.getMonth()+Number(b.dataset.calMes),1); render(); })); $$
-('#main [data-cal-dia]').forEach(b=>b.addEventListener('click',()=>{CAL_SEL=b.dataset.calDia;render()}));
-  $$('#main [data-edit-nota]').forEach(b=>b.addEventListener('click',()=>formNota(b.dataset.editNota)));    $$
-('#main [data-hist-estado]').forEach(c=>c.addEventListener('click',()=>{
+  wireCardActions($('#main'));
+  $$('#main [data-retry]').forEach(b=>b.addEventListener('click',()=>{LOAD_ERR='';render();load()}));
+  $$('#main [data-chip]').forEach(c=>c.addEventListener('click',()=>{FILTRO_DIA=c.dataset.chip;render()}));
+  $$('#main [data-go]').forEach(b=>b.addEventListener('click',()=>go(b.dataset.go)));
+  $$('#main [data-cal-mes]').forEach(b=>b.addEventListener('click',()=>{
+    CAL_MONTH=new Date(CAL_MONTH.getFullYear(),CAL_MONTH.getMonth()+Number(b.dataset.calMes),1); render();
+  }));
+  $$('#main [data-cal-dia]').forEach(b=>b.addEventListener('click',()=>{CAL_SEL=b.dataset.calDia;render()}));
+  $$('#main [data-edit-nota]').forEach(b=>b.addEventListener('click',()=>formNota(b.dataset.editNota)));
+
+  // --- Historial: filtros, tipo y buscador ---
+  $$('#main [data-hist-estado]').forEach(c=>c.addEventListener('click',()=>{
     HIST_ESTADO=c.dataset.histEstado; render();
   }));
   const histTipo=$('#hist-tipo');
@@ -320,8 +335,12 @@ function wireMainEvents() {
     });
   }
 
-  $$('#main [data-rep-estado]').forEach(b=>b.addEventListener('click',()=>{ const e=b.dataset.repEstado; verTareasEnModal(t=>t.estado===e, ESTADO_LABEL[e]\vert{}\vert{}e); })); $$
-('#main [data-rep-tipo]').forEach(b=>b.addEventListener('click',()=>{
+  // --- Reportes: drill-down ---
+  $$('#main [data-rep-estado]').forEach(b=>b.addEventListener('click',()=>{
+    const e=b.dataset.repEstado;
+    verTareasEnModal(t=>t.estado===e, ESTADO_LABEL[e]||e);
+  }));
+  $$('#main [data-rep-tipo]').forEach(b=>b.addEventListener('click',()=>{
     const tp=b.dataset.repTipo;
     verTareasEnModal(t=>t.tipo===tp, TIPO_LABEL[tp]||tp);
   }));
@@ -478,6 +497,7 @@ function vistaReportes() {
   </div>`;
 }
 
+// ============ NUEVO: Vista Historial (Fase 1) ============
 function filtrarHistorial() {
   const hoy=today();
   let list=(DB.tareas||[]).slice();
@@ -491,7 +511,7 @@ function filtrarHistorial() {
     const q=HIST_BUSCAR.trim().toLowerCase();
     if(q) list=list.filter(t=>(t.titulo||'').toLowerCase().includes(q)||(t.notas||'').toLowerCase().includes(q));
   }
-  return list.sort((a,b)=>byFecha(b,a));
+  return list.sort((a,b)=>byFecha(b,a)); // más recientes primero
 }
 
 function vistaHistorial() {
@@ -524,6 +544,7 @@ function vistaHistorial() {
     : `<div class="empty">${icon('alert','lg')}<strong>Sin resultados</strong><span>Ajusta los filtros</span></div>`}</div>`;
 }
 
+// ============ NUEVO: Modal drill-down (Reportes → detalle) ============
 function verTareasEnModal(filtro, titulo) {
   const list=(DB.tareas||[]).filter(filtro).sort((a,b)=>byFecha(b,a));
   abrirModal(`<div class="form-header">
@@ -699,7 +720,37 @@ function ayudaInstalar() {
 }
 
 function wireInstall() {
-  const btn=$('#btn-install'); if (isStandalone()) return; btn.hidden=false; window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();INSTALL_PROMPT=e;btn.hidden=false}); window.addEventListener('appinstalled',()=>{INSTALL_PROMPT=null;btn.hidden=true;say('App instalada')}); btn.addEventListener('click',async()=>{ if(!INSTALL_PROMPT){ayudaInstalar();return} INSTALL_PROMPT.prompt(); const {outcome}=await INSTALL_PROMPT.userChoice; INSTALL_PROMPT=null; if(outcome==='accepted'){btn.hidden=true} }); }  function wireGlobal() { $$('#bottom-nav button').forEach(b=>b.addEventListener('click',()=>go(b.dataset.view)));
+  const btn=$('#btn-install');
+  if (!btn) return;
+  if (isStandalone()) { btn.hidden=true; return; }
+  // Mostrar siempre el botón si no está instalada (Chrome a veces no dispara beforeinstallprompt)
+  btn.hidden=false;
+  btn.textContent='Instalar';
+  window.addEventListener('beforeinstallprompt', e => {
+    e.preventDefault();
+    INSTALL_PROMPT = e;
+    btn.hidden = false;
+  });
+  window.addEventListener('appinstalled', () => {
+    INSTALL_PROMPT = null;
+    btn.hidden = true;
+    say('App instalada');
+  });
+  btn.addEventListener('click', async () => {
+    if (INSTALL_PROMPT) {
+      INSTALL_PROMPT.prompt();
+      const { outcome } = await INSTALL_PROMPT.userChoice;
+      INSTALL_PROMPT = null;
+      if (outcome === 'accepted') btn.hidden = true;
+      return;
+    }
+    // Fallback: instrucciones manuales (menú ⋮ de Chrome)
+    ayudaInstalar();
+  });
+}
+
+function wireGlobal() {
+  $$('#bottom-nav button').forEach(b=>b.addEventListener('click',()=>go(b.dataset.view)));
   $('#fab').addEventListener('click',()=>VIEW==='notas'?formNota():formTarea());
   $('#btn-theme').addEventListener('click',toggleTema);
   document.addEventListener('keydown',e=>{if(e.key==='Escape')cerrarModal()});
@@ -709,8 +760,13 @@ function wireInstall() {
     const habia=!!navigator.serviceWorker.controller; let recargado=false;
     navigator.serviceWorker.addEventListener('controllerchange',()=>{ if(habia&&!recargado){recargado=true;location.reload()} });
     navigator.serviceWorker.addEventListener('message', handleSWMessage);
-    window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(()=>{}));
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('/sw.js', { scope: '/' })
+        .then(reg => { console.log('[SW] registrado', reg.scope); })
+        .catch(err => { console.warn('[SW] error', err); });
+    });
   }
+  // Reprogramar alarmas al volver a la app (Android)
   document.addEventListener('visibilitychange',()=>{
     if(document.visibilityState==='visible') scheduleAllAlarms();
   });
@@ -725,4 +781,3 @@ function init() {
   });
 }
 if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',init); else init();
-```[cite: 8]
