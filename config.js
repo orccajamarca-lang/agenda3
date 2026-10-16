@@ -10,5 +10,5 @@ const APP_CONFIG = {
   nombre: "Mi Agenda",
   zonaHoraria: "America/Lima",
   locale: "es-PE",
-  version: "3.1.0"
+  version: "3.1.1"
 };
