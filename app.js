@@ -287,6 +287,7 @@ function resolverRing(accion) {
   RING_CUR = null;
   mostrarSiguiente();
 }
+const pasoLaHora = p => p.fecha && limaTs(p.fecha, p.hora) - alarmMin(p) * 60000 < Date.now() - 60000;
 function marcarHecha(item, kind) {
   if (kind !== 'tarea') return;
   const t = (DB.tareas || []).find(x => String(x.id) === String(item.id));
@@ -374,6 +375,7 @@ function abrirPanelAlarmas() {
   const prox = proximasAlarmas(5);
   const d = abrirModal(`<div class="form-header"><div><p style="font-size:11px;color:var(--muted);font-weight:800;text-transform:uppercase">Alarmas</p><h2>Centro de alarmas</h2></div><button type="button" class="icon-btn" data-cerrar>${icon('x')}</button></div>
   <div class="form-body panel">
+    <p class="panel-note" id="p-ver">Servidor: comprobando…</p>
     <p class="panel-note"><b>Cómo suena en tu celular:</b> cada alarma se crea en Google Calendar y la app Calendar del teléfono la dispara aunque esta app esté cerrada. Usa la misma cuenta de Google en Calendar.</p>
     <button type="button" class="btn primary block" id="p-test-cal">${icon('bell','sm')} Probar alarma del celular (en 2 min)</button>
     <button type="button" class="btn ghost block" id="p-sync">Sincronizar todas mis alarmas con Calendar</button>
@@ -396,6 +398,7 @@ function abrirPanelAlarmas() {
   <div class="form-footer"><button type="button" class="btn primary" data-cerrar>Cerrar</button></div>`);
   d.querySelectorAll('[data-cerrar]').forEach(b => b.addEventListener('click', cerrarModal));
   const q = s => d.querySelector(s);
+  api('ping').then(r => { const e = q('#p-ver'); if (e) e.innerHTML = r && r.version ? '✅ Servidor v' + esc(r.version) + ' actualizado' : '❌ <b>El servidor sigue con el Code.gs ANTIGUO</b>: pega el nuevo, ejecuta setup e implementa una Nueva versión.'; }).catch(() => { const e = q('#p-ver'); if (e) e.textContent = '⚠ No se pudo consultar el servidor'; });
   q('#p-test-cal').addEventListener('click', async e => {
     const b = e.currentTarget; b.disabled = true;
     try {
@@ -502,6 +505,7 @@ async function act(action,params,msg,cambioLocal) {
   try {
     const r = await api(action,params);
     if (r && r.cal_error) say("Guardado, pero Google Calendar falló: "+r.cal_error,"error");
+    else if (params && params.recordatorio && /^(add|update)/.test(action) && r && !r.cal_id && !params.alarma_dias && !pasoLaHora(params)) say('⚠ Se guardó, pero NO se creó la alarma en Calendar. Revisa que Code.gs esté actualizado e implementado como Nueva versión (🔔 → estado del servidor).','error');
     else if (msg) say(msg);
   } catch(e) { say(e.message,"error"); }
   await refrescar();
