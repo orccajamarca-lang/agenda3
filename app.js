@@ -22,7 +22,6 @@ const ALARM_OPTS = [
   { v: 60, l: '1 hora antes' },
   { v: 1440, l: '1 día antes' }
 ];
-const ALARM_TIMERS = new Map();
 let NOTIF_PERM = (typeof Notification !== 'undefined') ? Notification.permission : 'denied';
 
 const $ = s => document.querySelector(s);
@@ -37,6 +36,11 @@ const fmtFecha = d => d ? new Date(d+'T12:00:00').toLocaleDateString(APP_CONFIG.
 const fmtLarga = d => d ? new Date(d+'T12:00:00').toLocaleDateString(APP_CONFIG.locale,{weekday:'long',day:'numeric',month:'long'}) : '';
 const byFecha = (a,b) => ((a.fecha||'')+(a.hora||'')).localeCompare((b.fecha||'')+(b.hora||''));
 const pendiente = t => t.estado!=='atendido' && t.estado!=='cancelado';
+/* =========================================================
+   ALARMAS v4
+   · Celular (app cerrada / bloqueado): las crea Google Calendar desde el backend.
+   · App abierta: pantalla de alarma con sonido + notificación del sistema.
+   ========================================================= */
 const hasAlarm = o => o && (o.recordatorio === true || o.recordatorio === 'true' || o.recordatorio === 1 || o.recordatorio === '1');
 const alarmMin = o => {
   const n = parseInt(o && o.recordatorio_min, 10);
@@ -47,26 +51,84 @@ const alarmLabel = min => {
   return o ? o.l : (min ? min + ' min antes' : 'A la hora');
 };
 
-function parseFechaHora(fecha, hora) {
-  if (!fecha) return null;
-  const h = (hora && /^\d{2}:\d{2}$/.test(hora)) ? hora : '09:00';
-  // Interpretar en zona America/Lima
-  const iso = fecha + 'T' + h + ':00';
-  // Crear Date en local y ajustar si el navegador no está en Lima (aproximación robusta)
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return null;
-  return d;
+// ---- Fechas en hora de Lima (UTC-5, sin horario de verano) ----
+const LIMA_OFF = '-05:00';
+const DOW_SHORT = ['', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom'];
+const DOW_LETTER = ['', 'L', 'M', 'X', 'J', 'V', 'S', 'D'];
+const limaTs = (ds, h) => new Date(ds + 'T' + ((h && /^\d{2}:\d{2}$/.test(h)) ? h : '09:00') + ':00' + LIMA_OFF).getTime();
+const isoDow = ds => { const [y, m, d] = ds.split('-').map(Number); const w = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); return w === 0 ? 7 : w; };
+const diasArr = o => [...new Set(String((o && o.alarma_dias) == null ? '' : o.alarma_dias).split(',').map(n => parseInt(n, 10)).filter(n => n >= 1 && n <= 7))].sort((a, b) => a - b);
+function diasLabel(arr) {
+  if (!arr.length) return '';
+  const k = arr.join(',');
+  if (k === '1,2,3,4,5,6,7') return 'Todos los días';
+  if (k === '1,2,3,4,5') return 'Lun–Vie';
+  if (k === '6,7') return 'Sáb–Dom';
+  return arr.map(n => DOW_SHORT[n]).join(', ');
+}
+const alarmActive = o => !!(hasAlarm(o) && o.fecha && o.estado !== 'atendido' && o.estado !== 'cancelado');
+const repite = o => alarmActive(o) && diasArr(o).length > 0;
+const ocurreHoy = o => repite(o) && o.fecha <= today() && diasArr(o).includes(isoDow(today()));
+
+// Instantes (ms) en que debe sonar `item` dentro de [fromMs, toMs]
+function alarmInstants(item, fromMs, toMs) {
+  if (!alarmActive(item)) return [];
+  const off = alarmMin(item) * 60000, dias = diasArr(item), out = [];
+  if (!dias.length) {
+    const ts = limaTs(item.fecha, item.hora) - off;
+    if (ts >= fromMs && ts <= toMs) out.push(ts);
+    return out;
+  }
+  const base = today();
+  for (let k = -2; k <= 16; k++) {
+    const ds = addDays(base, k);
+    if (ds < item.fecha || !dias.includes(isoDow(ds))) continue;
+    const ts = limaTs(ds, item.hora) - off;
+    if (ts >= fromMs && ts <= toMs) out.push(ts);
+  }
+  return out;
 }
 
-function calcAlarmTime(item) {
-  if (!hasAlarm(item) || !item.fecha) return null;
-  if (item.estado === 'atendido' || item.estado === 'cancelado') return null;
-  const base = parseFechaHora(item.fecha, item.hora);
-  if (!base) return null;
-  const ms = base.getTime() - (alarmMin(item) * 60 * 1000);
-  return new Date(ms);
+function alarmSummary(o) {
+  const h = o.hora || '09:00';
+  const cuando = o.dias.length
+    ? diasLabel(o.dias) + (o.fecha && o.fecha > today() ? ' desde ' + fmtFecha(o.fecha) : '')
+    : (o.fecha ? 'Una vez · ' + fmtFecha(o.fecha) : 'Una vez');
+  return 'Sonará: ' + cuando + ' · ' + h + (o.hora ? '' : ' (sin hora → 09:00)') + (o.min ? ' · ' + alarmLabel(o.min) : '');
 }
 
+// ---- Almacenamiento local ----
+const LS_FIRED = 'mi_agenda_fired', LS_SNOOZE = 'mi_agenda_snooze', LS_INAPP = 'mi_agenda_inapp', LS_INIT = 'mi_agenda_v4_init';
+const lsGet = (k, d) => { try { const v = JSON.parse(localStorage.getItem(k)); return v == null ? d : v; } catch { return d; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+const RING_WINDOW = 3 * 60 * 1000;        // una alarma "vence" a los 3 min
+const MISSED_WINDOW = 6 * 60 * 60 * 1000; // se avisa de las perdidas de las últimas 6 h
+let FIRED = lsGet(LS_FIRED, {});
+let SNOOZE = lsGet(LS_SNOOZE, {});
+let MISSED = [];
+let RING_QUEUE = [], RING_CUR = null, RING_TIMER = null, RING_STOP = null, WAKE = null, AC = null;
+let AFTER_DONE = false;
+const inAppOn = () => lsGet(LS_INAPP, true) !== false;
+const tagDe = (kind, id) => 'alarm-' + kind + '-' + id;
+const findItem = (kind, id) => ((kind === 'nota' ? DB.notas : DB.tareas) || []).find(x => String(x.id) === String(id));
+const forEachAlarmItem = fn => {
+  (DB.tareas || []).forEach(t => fn(t, 'tarea'));
+  (DB.notas || []).forEach(n => fn(n, 'nota'));
+};
+const tituloDe = (item, kind) => kind === 'nota'
+  ? (String(item.texto || '').replace(/\s+/g, ' ').trim().slice(0, 100) || 'Recordatorio de nota')
+  : (item.titulo || 'Actividad programada');
+
+function guardarFired() {
+  const lim = Date.now() - 3 * 864e5;
+  Object.keys(FIRED).forEach(k => { if (FIRED[k] < lim) delete FIRED[k]; });
+  lsSet(LS_FIRED, FIRED);
+}
+function actualizarBadge() {
+  const b = $('#btn-alarm .badge'); if (b) b.hidden = !MISSED.length;
+}
+
+// ---- Permiso de notificaciones ----
 async function pedirPermisoNotif() {
   if (typeof Notification === 'undefined') {
     say('Este navegador no soporta notificaciones', 'error');
@@ -80,8 +142,8 @@ async function pedirPermisoNotif() {
   try {
     const p = await Notification.requestPermission();
     NOTIF_PERM = p;
-    if (p === 'granted') { say('Permiso de alarmas concedido'); return true; }
-    say('Sin permiso no se pueden programar alarmas', 'error');
+    if (p === 'granted') { say('Permiso concedido'); return true; }
+    say('Sin permiso no habrá aviso dentro de la app (Calendar seguirá avisando)', 'error');
     return false;
   } catch (e) {
     say('No se pudo pedir permiso', 'error');
@@ -89,104 +151,285 @@ async function pedirPermisoNotif() {
   }
 }
 
-function clearAllAlarmTimers() {
-  ALARM_TIMERS.forEach(id => clearTimeout(id));
-  ALARM_TIMERS.clear();
+// ---- Notificación del sistema (siempre vía Service Worker: único método válido en Android) ----
+async function mostrarNotifSistema(item, kind) {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  const opts = {
+    body: kind === 'nota' ? 'Recordatorio de nota' : 'Alarma',
+    icon: '/icons/icon-192.png',
+    badge: '/icons/favicon-32.png',
+    tag: tagDe(kind, item.id),
+    renotify: true,
+    requireInteraction: true,
+    vibrate: [300, 120, 300, 120, 300, 120, 500],
+    data: { id: item.id, kind },
+    actions: kind === 'tarea'
+      ? [{ action: 'done', title: '✓ Hecha' }, { action: 'snooze', title: '⏱ +10 min' }]
+      : [{ action: 'snooze', title: '⏱ +10 min' }]
+  };
+  const title = (kind === 'nota' ? '📝 ' : '🔔 ') + tituloDe(item, kind);
+  try {
+    if ('serviceWorker' in navigator) {
+      const reg = await Promise.race([navigator.serviceWorker.ready, new Promise((_, rej) => setTimeout(rej, 3000))]);
+      await reg.showNotification(title, opts);
+      return;
+    }
+  } catch (_) {}
+  try { new Notification(title, { body: opts.body, tag: opts.tag, icon: opts.icon }); } catch (_) {}
+}
+async function cerrarNotifSistema(c) {
+  try {
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (!reg) return;
+    (await reg.getNotifications({ tag: tagDe(c.kind, c.item.id) })).forEach(n => n.close());
+  } catch (_) {}
 }
 
-function scheduleOneAlarm(item, kind) {
-  const when = calcAlarmTime(item);
-  if (!when) return;
-  const now = Date.now();
-  const delay = when.getTime() - now;
-  if (delay < -60000) return; // ya pasó hace más de 1 min
-  const key = kind + ':' + item.id;
-  if (ALARM_TIMERS.has(key)) {
-    clearTimeout(ALARM_TIMERS.get(key));
-    ALARM_TIMERS.delete(key);
+// ---- Sonido (Web Audio) ----
+function unlockAudio() {
+  try {
+    if (!AC) { const C = window.AudioContext || window.webkitAudioContext; if (!C) return; AC = new C(); }
+    if (AC.state === 'suspended') AC.resume();
+  } catch (_) {}
+}
+function beep() {
+  const warn = $('#ring-warn');
+  if (!AC || AC.state !== 'running') { if (warn) warn.hidden = false; return; }
+  if (warn) warn.hidden = true;
+  const t = AC.currentTime;
+  for (let i = 0; i < 4; i++) {
+    const o = AC.createOscillator(), g = AC.createGain(), t0 = t + i * 0.2;
+    o.type = 'square';
+    o.frequency.value = i % 2 ? 880 : 1175;
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(0.4, t0 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.17);
+    o.connect(g); g.connect(AC.destination);
+    o.start(t0); o.stop(t0 + 0.18);
   }
-  // Si ya debería sonar (hasta 1 min de retraso), disparar ya
-  const fire = () => dispararAlarma(item, kind);
-  if (delay <= 0) {
-    setTimeout(fire, 400);
-    return;
-  }
-  // setTimeout max ~24.8 días; para alarmas lejanas solo programamos si < 12h
-  if (delay > 12 * 60 * 60 * 1000) return;
-  const tid = setTimeout(fire, delay);
-  ALARM_TIMERS.set(key, tid);
+}
+const vibrar = () => { try { if (navigator.vibrate && (!navigator.userActivation || navigator.userActivation.hasBeenActive)) navigator.vibrate([300, 120, 300, 120, 500]); } catch (_) {} };
+async function pedirWake() {
+  try {
+    if (navigator.wakeLock && !WAKE) {
+      WAKE = await navigator.wakeLock.request('screen');
+      WAKE.addEventListener('release', () => { WAKE = null; });
+    }
+  } catch (_) {}
+}
+function detenerSonido() {
+  clearInterval(RING_TIMER); clearTimeout(RING_STOP); RING_TIMER = RING_STOP = null;
+  try { if (navigator.vibrate && navigator.userActivation && navigator.userActivation.hasBeenActive) navigator.vibrate(0); } catch (_) {}
+  try { if (WAKE) WAKE.release(); } catch (_) {}
+  WAKE = null;
+}
+function iniciarSonido() {
+  detenerSonido();
+  unlockAudio(); beep(); vibrar();
+  RING_TIMER = setInterval(() => { beep(); vibrar(); }, 1600);
+  RING_STOP = setTimeout(detenerSonido, 3 * 60 * 1000); // deja de sonar a los 3 min; la notificación queda
+  pedirWake();
 }
 
-function scheduleAllAlarms() {
-  clearAllAlarmTimers();
-  if (NOTIF_PERM !== 'granted') return;
-  (DB.tareas || []).forEach(t => scheduleOneAlarm(t, 'tarea'));
-  (DB.notas || []).forEach(n => scheduleOneAlarm(n, 'nota'));
-}
-
-async function dispararAlarma(item, kind) {
-  if (NOTIF_PERM !== 'granted') return;
-  const title = kind === 'nota' ? '📝 Nota' : '🔔 Alarma';
-  const body = kind === 'nota'
-    ? (String(item.texto || '').slice(0, 120) || 'Recordatorio de nota')
-    : (item.titulo || 'Actividad programada');
-  const tag = 'alarm-' + kind + '-' + item.id;
-
-  // Preferir Service Worker (más fiable en Android)
-  if (navigator.serviceWorker && navigator.serviceWorker.controller) {
-    navigator.serviceWorker.controller.postMessage({
-      type: 'SHOW_ALARM',
-      id: item.id,
-      kind,
-      title,
-      body,
-      tag
+// ---- Pantalla de alarma ----
+function overlayEl() {
+  let el = $('#alarm-ring');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'alarm-ring'; el.hidden = true;
+    el.setAttribute('role', 'alertdialog'); el.setAttribute('aria-modal', 'true');
+    document.body.appendChild(el);
+    el.addEventListener('click', e => {
+      const b = e.target.closest('[data-ring]');
+      if (b) resolverRing(b.dataset.ring);
     });
-  } else if (typeof Notification !== 'undefined') {
-    try {
-      new Notification(title, {
-        body,
-        icon: '/icons/icon-192.png',
-        tag,
-        renotify: true,
-        requireInteraction: true,
-        vibrate: [300, 120, 300, 120, 300],
-        data: { id: item.id, kind }
-      });
-    } catch (_) {}
   }
-  // Feedback in-app
-  say(kind === 'nota' ? 'Recordatorio de nota' : '¡Alarma: ' + (item.titulo || '') );
+  return el;
 }
+function ringAlarm(item, kind, ts) {
+  mostrarNotifSistema(item, kind);
+  RING_QUEUE.push({ item, kind, ts: ts || Date.now() });
+  if (!RING_CUR) mostrarSiguiente();
+}
+function mostrarSiguiente() {
+  RING_CUR = RING_QUEUE.shift() || null;
+  const el = overlayEl();
+  if (!RING_CUR) { el.hidden = true; el.innerHTML = ''; return; }
+  const { item, kind, ts } = RING_CUR;
+  const esTest = String(item.id) === 'test';
+  const hh = new Date(ts).toLocaleTimeString(APP_CONFIG.locale, { hour: '2-digit', minute: '2-digit', timeZone: TZ });
+  el.innerHTML = `<div class="ring-card">
+    <div class="ring-bell">${icon('bell')}</div>
+    <small>${kind === 'nota' ? 'Recordatorio de nota' : 'Alarma'} · ${esc(hh)}</small>
+    <h2>${esc(tituloDe(item, kind))}</h2>
+    ${kind === 'tarea' && item.notas ? `<p>${esc(String(item.notas).slice(0, 160))}</p>` : ''}
+    <div id="ring-warn" hidden>🔇 Toca la pantalla para activar el sonido</div>
+    <div class="ring-actions">
+      ${kind === 'tarea' && !esTest ? '<button type="button" class="btn primary" data-ring="done">✓ Hecha</button>' : ''}
+      <button type="button" class="btn ghost" data-ring="snooze">⏱ +10 min</button>
+      <button type="button" class="btn ghost" data-ring="stop">Detener</button>
+    </div>
+    ${RING_QUEUE.length ? `<small>+${RING_QUEUE.length} alarma(s) más en cola</small>` : ''}
+  </div>`;
+  el.hidden = false;
+  iniciarSonido();
+}
+function resolverRing(accion) {
+  const cur = RING_CUR; if (!cur) return;
+  detenerSonido();
+  cerrarNotifSistema(cur);
+  if (accion === 'snooze') {
+    SNOOZE[cur.kind + ':' + cur.item.id] = Date.now() + 10 * 60000;
+    lsSet(LS_SNOOZE, SNOOZE);
+    say('Pospuesta 10 min');
+  }
+  if (accion === 'done') marcarHecha(cur.item, cur.kind);
+  RING_CUR = null;
+  mostrarSiguiente();
+}
+function marcarHecha(item, kind) {
+  if (kind !== 'tarea') return;
+  const t = (DB.tareas || []).find(x => String(x.id) === String(item.id));
+  if (t && pendiente(t)) act('setEstadoTarea', { id: t.id, estado: 'atendido' }, 'Atendida · alarma detenida', () => { t.estado = 'atendido'; });
+}
+
+// ---- Motor: revisa cada 10 s mientras la app esté abierta ----
+function tick() {
+  if (!DB.loaded || !inAppOn()) return;
+  const now = Date.now();
+  let cambio = false;
+  forEachAlarmItem((item, kind) => {
+    alarmInstants(item, now - RING_WINDOW, now).forEach(ts => {
+      const key = kind + ':' + item.id + ':' + ts;
+      if (FIRED[key]) return;
+      FIRED[key] = now; cambio = true;
+      ringAlarm(item, kind, ts);
+    });
+  });
+  Object.keys(SNOOZE).forEach(k => {
+    if (SNOOZE[k] > now) return;
+    const i = k.indexOf(':'), kind = k.slice(0, i), id = k.slice(i + 1);
+    delete SNOOZE[k]; lsSet(LS_SNOOZE, SNOOZE);
+    const item = findItem(kind, id);
+    if (item && alarmActive(item)) ringAlarm(item, kind, now);
+  });
+  if (cambio) guardarFired();
+}
+
+// Alarmas que vencieron mientras la app estaba cerrada (Calendar ya avisó en el celular)
+function catchUp() {
+  if (!lsGet(LS_INIT, false)) { lsSet(LS_INIT, true); return; } // primera vez en v4: no listar el pasado
+  const now = Date.now(); let n = 0;
+  forEachAlarmItem((item, kind) => {
+    alarmInstants(item, now - MISSED_WINDOW, now - RING_WINDOW - 1).forEach(ts => {
+      const key = kind + ':' + item.id + ':' + ts;
+      if (FIRED[key]) return;
+      FIRED[key] = now; n++;
+      MISSED.push({ kind, id: item.id, ts, title: tituloDe(item, kind) });
+    });
+  });
+  if (n) { guardarFired(); actualizarBadge(); say(n + ' alarma(s) sonaron mientras no estabas aquí · toca 🔔'); }
+}
+
+function proximasAlarmas(max) {
+  const now = Date.now(), res = [];
+  forEachAlarmItem((item, kind) => {
+    const l = alarmInstants(item, now, now + 15 * 864e5).sort((a, b) => a - b);
+    if (l.length) res.push({ kind, ts: l[0], title: tituloDe(item, kind), rep: diasLabel(diasArr(item)) });
+  });
+  return res.sort((a, b) => a.ts - b.ts).slice(0, max);
+}
+const fmtTs = ts => new Date(ts).toLocaleString(APP_CONFIG.locale, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: TZ });
 
 function handleSWMessage(e) {
   if (!e.data) return;
+  const id = e.data.id, kind = e.data.kind || 'tarea';
   if (e.data.type === 'SNOOZE_ALARM') {
-    const id = e.data.id, kind = e.data.kind || 'tarea';
-    const list = kind === 'nota' ? DB.notas : DB.tareas;
-    const item = (list || []).find(x => String(x.id) === String(id));
-    if (!item) return;
-    // Reprogramar +10 min desde ahora
-    const key = kind + ':' + id;
-    if (ALARM_TIMERS.has(key)) clearTimeout(ALARM_TIMERS.get(key));
-    const tid = setTimeout(() => dispararAlarma(item, kind), 10 * 60 * 1000);
-    ALARM_TIMERS.set(key, tid);
+    SNOOZE[kind + ':' + id] = Date.now() + 10 * 60000;
+    lsSet(LS_SNOOZE, SNOOZE);
     say('Alarma pospuesta 10 min');
   }
   if (e.data.type === 'DONE_ALARM') {
-    const id = e.data.id, kind = e.data.kind || 'tarea';
-    if (kind === 'tarea') {
-      const t = (DB.tareas || []).find(x => String(x.id) === String(id));
-      if (t && pendiente(t)) {
-        act('setEstadoTarea', { id: t.id, estado: 'atendido' }, 'Atendida', () => { t.estado = 'atendido'; });
-      }
-    }
+    const item = findItem(kind, id);
+    if (item) marcarHecha(item, kind);
   }
+}
+
+function procesarQuery() {
+  const qp = new URLSearchParams(location.search), kind = qp.get('kind') || 'tarea';
+  const d = qp.get('done'), s = qp.get('snooze');
+  if (d) { const it = findItem(kind, d); if (it) marcarHecha(it, kind); }
+  if (s) { SNOOZE[kind + ':' + s] = Date.now() + 10 * 60000; lsSet(LS_SNOOZE, SNOOZE); say('Alarma pospuesta 10 min'); }
+  if (d || s) { try { history.replaceState(null, '', '/'); } catch (_) {} }
+}
+function afterLoad() {
+  if (!AFTER_DONE) { AFTER_DONE = true; catchUp(); procesarQuery(); }
+  tick();
+}
+
+// ---- Centro de alarmas ----
+function abrirPanelAlarmas() {
+  const perm = typeof Notification === 'undefined' ? 'no soportado' : Notification.permission;
+  const permTxt = perm === 'granted' ? 'Activadas' : perm === 'denied' ? 'Bloqueadas (actívalas en Ajustes del navegador)' : perm === 'default' ? 'Sin permitir' : 'No soportadas';
+  const prox = proximasAlarmas(5);
+  const d = abrirModal(`<div class="form-header"><div><p style="font-size:11px;color:var(--muted);font-weight:800;text-transform:uppercase">Alarmas</p><h2>Centro de alarmas</h2></div><button type="button" class="icon-btn" data-cerrar>${icon('x')}</button></div>
+  <div class="form-body panel">
+    <p class="panel-note"><b>Cómo suena en tu celular:</b> cada alarma se crea en Google Calendar y la app Calendar del teléfono la dispara aunque esta app esté cerrada. Usa la misma cuenta de Google en Calendar.</p>
+    <button type="button" class="btn primary block" id="p-test-cal">${icon('bell','sm')} Probar alarma del celular (en 2 min)</button>
+    <button type="button" class="btn ghost block" id="p-sync">Sincronizar todas mis alarmas con Calendar</button>
+    <hr class="sep">
+    <div class="panel-row"><div><strong>Avisos dentro de la app</strong><span>Notificaciones: ${esc(permTxt)}</span></div>${perm === 'default' ? '<button type="button" class="chip-btn" id="p-perm">Permitir</button>' : ''}</div>
+    <label class="check-line"><input type="checkbox" id="p-inapp" ${inAppOn() ? 'checked' : ''}/><span>Pantalla y sonido de alarma cuando la app esté abierta</span></label>
+    <button type="button" class="btn ghost block" id="p-test-app">Probar alarma en la app (10 s)</button>
+    ${MISSED.length ? `<div class="panel-list"><h3>Sonaron sin ti <button type="button" class="link-btn" id="p-clear">Limpiar</button></h3>${MISSED.slice(-8).reverse().map(m => `<div><span>${esc(m.title)}</span><small>${esc(fmtTs(m.ts))}</small></div>`).join('')}</div>` : ''}
+    <div class="panel-list"><h3>Próximas alarmas</h3>${prox.length ? prox.map(p => `<div><span>${p.kind === 'nota' ? '📝' : '🔔'} ${esc(p.title)}${p.rep ? ` <em>${esc(p.rep)}</em>` : ''}</span><small>${esc(fmtTs(p.ts))}</small></div>`).join('') : '<div><span>No tienes alarmas activas</span></div>'}</div>
+    <details class="tips"><summary>Cómo hacer que suene más fuerte (Android)</summary>
+      <ol>
+        <li>Ajustes del teléfono → Aplicaciones → <b>Calendar</b> → Notificaciones → categoría de <b>alertas/recordatorios de eventos</b>: Importancia <b>Urgente</b>, elige un <b>sonido</b> largo (puede ser un tono de alarma) y activa <b>mostrar en pantalla de bloqueo</b>.</li>
+        <li>Calendar → Batería → <b>Sin restricciones</b>.</li>
+        <li>Android 12+: Calendar → Permisos → <b>Alarmas y recordatorios</b>: permitir.</li>
+        <li>Revisa que <b>No molestar</b> permita Calendar y que el volumen de <b>notificaciones</b> esté alto.</li>
+      </ol>
+      <p>Los nombres exactos cambian según la marca del teléfono.</p>
+    </details>
+  </div>
+  <div class="form-footer"><button type="button" class="btn primary" data-cerrar>Cerrar</button></div>`);
+  d.querySelectorAll('[data-cerrar]').forEach(b => b.addEventListener('click', cerrarModal));
+  const q = s => d.querySelector(s);
+  q('#p-test-cal').addEventListener('click', async e => {
+    const b = e.currentTarget; b.disabled = true;
+    try {
+      const r = await api('testCalendar');
+      say('Evento de prueba para las ' + r.cuando + '. Bloquea el celular y espera.');
+    } catch (err) { say(err.message, 'error'); }
+    b.disabled = false;
+  });
+  q('#p-sync').addEventListener('click', async e => {
+    const b = e.currentTarget; b.disabled = true; b.textContent = 'Sincronizando…';
+    try {
+      const r = await api('syncCalendar', { force: true });
+      say(r.errores ? `${r.sincronizadas} ok, ${r.errores} con error: ${r.detalle}` : `${r.sincronizadas} alarma(s) sincronizada(s)`, r.errores ? 'error' : 'ok');
+      await refrescar();
+    } catch (err) { say(err.message, 'error'); }
+    b.disabled = false; b.textContent = 'Sincronizar todas mis alarmas con Calendar';
+  });
+  const bp = q('#p-perm');
+  if (bp) bp.addEventListener('click', async () => { await pedirPermisoNotif(); abrirPanelAlarmas(); });
+  q('#p-inapp').addEventListener('change', e => lsSet(LS_INAPP, e.target.checked));
+  q('#p-test-app').addEventListener('click', () => {
+    unlockAudio();
+    cerrarModal();
+    say('Sonará en 10 segundos…');
+    setTimeout(() => ringAlarm({ id: 'test', titulo: 'Alarma de prueba', notas: 'Si ves esto y oyes el tono, la alarma dentro de la app funciona.' }, 'tarea', Date.now()), 10000);
+  });
+  const bc = q('#p-clear');
+  if (bc) bc.addEventListener('click', () => { MISSED = []; actualizarBadge(); abrirPanelAlarmas(); });
 }
 
 function semaforo(t) {
   if (t.estado==='atendido') return 'v-atendido';
   if (t.estado==='cancelado') return 'v-cancelado';
+  if (repite(t)) return 'v-proximo'; // alarma repetitiva: nunca "vencida"
   const h = today();
   if (t.fecha<h) return 'v-vencido';
   if (t.fecha<=addDays(h,1)) return 'v-hoy';
@@ -234,13 +477,13 @@ async function load() {
   if (cached?.tareas) { Object.assign(DB,cached); DB.loaded=true; render(); }
   try {
     const data = await api('getAll');
-    Object.assign(DB,data); DB.loaded=true; LOAD_ERR=''; guardarCache(); render(); scheduleAllAlarms();
+    Object.assign(DB,data); DB.loaded=true; LOAD_ERR=''; guardarCache(); render(); afterLoad();
     try {
       const r = await api('generarRecurrentes');
       if (r?.creadas>0) {
         say(`${r.creadas} recurrente(s) generada(s)`);
         const fresh = await api('getAll');
-        Object.assign(DB,fresh); guardarCache(); render(); scheduleAllAlarms();
+        Object.assign(DB,fresh); guardarCache(); render(); tick();
       }
     } catch(_){}
   } catch(e) {
@@ -250,14 +493,17 @@ async function load() {
 }
 
 async function refrescar() {
-  try { const d=await api('getAll'); Object.assign(DB,d); DB.loaded=true; LOAD_ERR=''; guardarCache(); render(); scheduleAllAlarms(); }
+  try { const d=await api('getAll'); Object.assign(DB,d); DB.loaded=true; LOAD_ERR=''; guardarCache(); render(); tick(); }
   catch(e) { say(e.message,'error'); }
 }
 
 async function act(action,params,msg,cambioLocal) {
-  if (cambioLocal) { cambioLocal(); render(); guardarCache(); scheduleAllAlarms(); }
-  try { await api(action,params); if(msg) say(msg); }
-  catch(e) { say(e.message,'error'); }
+  if (cambioLocal) { cambioLocal(); render(); guardarCache(); }
+  try {
+    const r = await api(action,params);
+    if (r && r.cal_error) say("Guardado, pero Google Calendar falló: "+r.cal_error,"error");
+    else if (msg) say(msg);
+  } catch(e) { say(e.message,"error"); }
   await refrescar();
 }
 
@@ -352,10 +598,10 @@ function cardTarea(t) {
   if(t.recurrencia && t.recurrencia!=='unica') meta.push(`<span>${esc(REC_LABEL[t.recurrencia])}</span>`);
   meta.push(`<span>${fmtFecha(t.fecha)}${t.hora?' · '+esc(t.hora):''}</span>`);
   if(t.prioridad==='alta') meta.push('<span class="prio-alta">Alta</span>');
-  if(hasAlarm(t)) meta.push(`<span class="alarm">${icon('bell','sm')} ${esc(alarmLabel(alarmMin(t)))}</span>`);
+  if(hasAlarm(t)) meta.push(`<span class="alarm">${icon('bell','sm')} ${esc(alarmLabel(alarmMin(t)))}${diasArr(t).length?' · '+esc(diasLabel(diasArr(t))):''}</span>`);
   if(t.estado==='en_proceso') meta.push('<span class="proc">En proceso</span>');
   if(t.estado==='cancelado') meta.push('<span class="vencido">Cancelada</span>');
-  if(v==='v-vencido') meta.push('<span class="vencido">Vencida</span>');
+  if(v==='v-vencido'&&!repite(t)) meta.push('<span class="vencido">Vencida</span>');
   if(done) meta.push('<span class="done">Atendida</span>');
 
   return `<div class="task ${v} ${done?'done':''}">
@@ -376,7 +622,7 @@ function cardTarea(t) {
 function vistaInicio() {
   const hoy=today(), tareas=DB.tareas||[];
   const activas=tareas.filter(t=>t.estado!=='cancelado');
-  const vencidas=activas.filter(t=>pendiente(t)&&t.fecha<hoy);
+  const vencidas=activas.filter(t=>pendiente(t)&&t.fecha<hoy&&!repite(t));
   const deHoy=activas.filter(t=>t.fecha===hoy);
   const doneHoy=deHoy.filter(t=>t.estado==='atendido').length;
   const atendidas=tareas.filter(t=>t.estado==='atendido').length;
@@ -398,7 +644,7 @@ function vistaInicio() {
 function vistaDia() {
   const hoy=today();
   const filtros=['todas',...Object.keys(TIPO_LABEL)];
-  const tareas=(DB.tareas||[]).filter(t=>t.estado!=='cancelado'&&(t.fecha===hoy||(t.fecha<hoy&&pendiente(t))))
+  const tareas=(DB.tareas||[]).filter(t=>t.estado!=='cancelado'&&(t.fecha===hoy||(t.fecha<hoy&&pendiente(t)&&!repite(t))||ocurreHoy(t)))
     .filter(t=>FILTRO_DIA==='todas'||t.tipo===FILTRO_DIA).sort(byFecha);
 
   return `<div class="view-head"><div><h1>Mi día</h1><p>${tareas.length} actividad${tareas.length===1?'':'es'} hoy</p></div></div>
@@ -451,7 +697,7 @@ function vistaNotas() {
     <div style="flex:1;min-width:0">
       <div style="font-size:11px;color:var(--muted);font-weight:800;text-transform:uppercase;margin-bottom:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
         ${fmtFecha(n.fecha)}${n.hora?' · '+esc(n.hora):''}
-        ${hasAlarm(n)?`<span class="task-meta" style="margin:0"><span class="alarm">${icon('bell','sm')} ${esc(alarmLabel(alarmMin(n)))}</span></span>`:''}
+        ${hasAlarm(n)?`<span class="task-meta" style="margin:0"><span class="alarm">${icon('bell','sm')} ${esc(alarmLabel(alarmMin(n)))}${diasArr(n).length?' · '+esc(diasLabel(diasArr(n))):''}</span></span>`:''}
       </div>
       <div style="white-space:pre-wrap;font-size:14px">${esc(n.texto)}</div>
     </div>
@@ -502,7 +748,7 @@ function filtrarHistorial() {
   const hoy=today();
   let list=(DB.tareas||[]).slice();
   if(HIST_ESTADO==='vencidas'){
-    list=list.filter(t=>pendiente(t)&&t.fecha&&t.fecha<hoy);
+    list=list.filter(t=>pendiente(t)&&t.fecha&&t.fecha<hoy&&!repite(t));
   } else if(HIST_ESTADO!=='todas'){
     list=list.filter(t=>t.estado===HIST_ESTADO);
   }
@@ -566,125 +812,185 @@ function abrirModal(html) { const d=$('#modal'); d.innerHTML=html; if(!d.open)d.
 function cerrarModal() { const d=$('#modal'); if(d&&d.open)d.close(); }
 const opciones=(obj,sel)=>Object.entries(obj).map(([k,v])=>`<option value="${k}"${k===sel?' selected':''}>${v}</option>`).join('');
 
-function formTarea(id) {
-  const ex=id?DB.tareas.find(x=>String(x.id)===String(id)):null;
-  const t=ex||{titulo:'',tipo:'tarea_interna',prioridad:'media',fecha:today(),hora:'',recurrencia:'unica',programada:true,notas:'',recordatorio:false,recordatorio_min:0};
-  const recOn = hasAlarm(t);
-  const recMin = alarmMin(t);
-  const alarmRadios = ALARM_OPTS.map(o =>
-    `<label><input type="radio" name="rec_min" value="${o.v}" ${recOn && recMin===o.v?'checked':''}/>${o.l}</label>`
+// ---- Campo de alarma compartido (tareas y notas), estilo Notion ----
+function alarmFieldHTML(t) {
+  const on = hasAlarm(t), min = alarmMin(t);
+  const conocido = ALARM_OPTS.some(o => o.v === min);
+  const radios = ALARM_OPTS.map(o =>
+    `<label><input type="radio" name="rec_min" value="${o.v}" ${(min === o.v || (o.v === 0 && !conocido)) ? 'checked' : ''}/>${o.l}</label>`
   ).join('');
+  const dow = [1, 2, 3, 4, 5, 6, 7].map(n =>
+    `<button type="button" class="dow-btn" data-dow="${n}" aria-pressed="false" aria-label="${DOW_SHORT[n]}">${DOW_LETTER[n]}</button>`
+  ).join('');
+  return `<div class="alarm-field">
+    <label class="main-lab"><input type="checkbox" name="recordatorio" id="chk-alarm" ${on ? 'checked' : ''}/> ${icon('bell', 'sm')} Alarma en el celular</label>
+    <div id="af-body" ${on ? '' : 'hidden'}>
+      <div class="af-sub">Avisar</div>
+      <div class="alarm-opts">${radios}</div>
+      <div class="af-sub">Repetir</div>
+      <div class="seg" id="af-seg">
+        <button type="button" data-preset="once">Una vez</button>
+        <button type="button" data-preset="all">Todos los días</button>
+        <button type="button" data-preset="wk">Lun–Vie</button>
+        <button type="button" data-preset="we">Sáb–Dom</button>
+        <button type="button" data-preset="custom">Personalizado</button>
+      </div>
+      <div class="dow" id="af-dow" hidden>${dow}</div>
+      <p class="af-sum" id="af-sum"></p>
+    </div>
+    ${NOTIF_PERM !== 'granted' && NOTIF_PERM !== 'denied' ? `<div class="perm-banner" id="perm-banner">${icon('bell')}<div>La alarma del celular la envía Google Calendar. Permite notificaciones para que además suene aquí dentro.</div><button type="button" id="btn-perm">Permitir</button></div>` : ''}
+  </div>`;
+}
+
+function wireAlarmField(form, dias0) {
+  const chk = form.querySelector('#chk-alarm'), body = form.querySelector('#af-body');
+  const dowBox = form.querySelector('#af-dow'), sum = form.querySelector('#af-sum');
+  const rec = form.elements.recurrencia, hint = form.querySelector('#rec-hint');
+  const sel = new Set(dias0);
+  let custom = false;
+  const key = () => [...sel].sort((a, b) => a - b).join(',');
+  const preset = () => {
+    if (!sel.size) return custom ? 'custom' : 'once';
+    const k = key();
+    return k === '1,2,3,4,5,6,7' ? 'all' : k === '1,2,3,4,5' ? 'wk' : k === '6,7' ? 'we' : 'custom';
+  };
+  const minSel = () => parseInt((form.querySelector('input[name=rec_min]:checked') || {}).value, 10) || 0;
+
+  function refresh() {
+    const p = preset(), on = chk.checked;
+    body.hidden = !on;
+    form.querySelectorAll('#af-seg [data-preset]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.preset === p)));
+    dowBox.hidden = !(sel.size || custom);
+    form.querySelectorAll('[data-dow]').forEach(b => b.setAttribute('aria-pressed', String(sel.has(+b.dataset.dow))));
+    if (rec) {
+      const lock = on && sel.size > 0;
+      if (lock) rec.value = 'unica';
+      rec.disabled = lock;
+      if (hint) hint.hidden = !lock;
+    }
+    sum.textContent = alarmSummary({
+      fecha: form.elements.fecha ? form.elements.fecha.value : '',
+      hora: form.elements.hora ? form.elements.hora.value : '',
+      min: minSel(),
+      dias: [...sel].sort((a, b) => a - b)
+    });
+  }
+  const setSel = arr => { sel.clear(); arr.forEach(n => sel.add(n)); };
+  form.querySelectorAll('#af-seg [data-preset]').forEach(b => b.addEventListener('click', () => {
+    const p = b.dataset.preset;
+    if (p === 'once') { setSel([]); custom = false; }
+    else if (p === 'all') { setSel([1, 2, 3, 4, 5, 6, 7]); custom = false; }
+    else if (p === 'wk') { setSel([1, 2, 3, 4, 5]); custom = false; }
+    else if (p === 'we') { setSel([6, 7]); custom = false; }
+    else custom = true;
+    refresh();
+  }));
+  form.querySelectorAll('[data-dow]').forEach(b => b.addEventListener('click', () => {
+    const n = +b.dataset.dow;
+    if (sel.has(n)) sel.delete(n); else sel.add(n);
+    refresh();
+  }));
+  chk.addEventListener('change', refresh);
+  ['fecha', 'hora'].forEach(n => { if (form.elements[n]) form.elements[n].addEventListener('input', refresh); });
+  form.querySelectorAll('input[name=rec_min]').forEach(r => r.addEventListener('change', refresh));
+  const btnPerm = form.querySelector('#btn-perm');
+  if (btnPerm) btnPerm.addEventListener('click', async () => {
+    if (await pedirPermisoNotif()) { const b = form.querySelector('#perm-banner'); if (b) b.remove(); }
+  });
+  refresh();
+  return {
+    read() {
+      const on = chk.checked;
+      return {
+        recordatorio: on,
+        recordatorio_min: on ? minSel() : 0,
+        alarma_dias: on ? key() : ''
+      };
+    }
+  };
+}
+
+function formTarea(id) {
+  const ex = id ? DB.tareas.find(x => String(x.id) === String(id)) : null;
+  const t = ex || { titulo: '', tipo: 'tarea_interna', prioridad: 'media', fecha: today(), hora: '', recurrencia: 'unica', programada: true, notas: '', recordatorio: false, recordatorio_min: 0, alarma_dias: '' };
   abrirModal(`<form id="form-tarea">
-    <div class="form-header"><div><p style="font-size:11px;color:var(--muted);font-weight:800;text-transform:uppercase">${ex?'Editar':'Nueva'}</p><h2>${ex?'Editar':'Nueva'} actividad</h2></div><button type="button" class="icon-btn" data-cerrar>${icon('x')}</button></div>
+    <div class="form-header"><div><p style="font-size:11px;color:var(--muted);font-weight:800;text-transform:uppercase">${ex ? 'Editar' : 'Nueva'}</p><h2>${ex ? 'Editar' : 'Nueva'} actividad</h2></div><button type="button" class="icon-btn" data-cerrar>${icon('x')}</button></div>
     <div class="form-body">
       <div class="field"><label>Título</label><input name="titulo" required maxlength="200" value="${esc(t.titulo)}" placeholder="Ej: Asistencia técnica..." autofocus/></div>
       <div class="row-2">
-        <div class="field"><label>Tipo</label><select name="tipo">${opciones(TIPO_LABEL,t.tipo)}</select></div>
-        <div class="field"><label>Prioridad</label><select name="prioridad">${opciones(PRIO_LABEL,t.prioridad)}</select></div>
+        <div class="field"><label>Tipo</label><select name="tipo">${opciones(TIPO_LABEL, t.tipo)}</select></div>
+        <div class="field"><label>Prioridad</label><select name="prioridad">${opciones(PRIO_LABEL, t.prioridad)}</select></div>
       </div>
       <div class="row-2">
         <div class="field"><label>Fecha</label><input name="fecha" type="date" required value="${esc(t.fecha)}"/></div>
         <div class="field"><label>Hora</label><input name="hora" type="time" value="${esc(t.hora)}"/></div>
       </div>
-      <div class="field"><label>Recurrencia</label><select name="recurrencia">${opciones(REC_LABEL,t.recurrencia)}</select></div>
-      <label class="check-line"><input type="checkbox" name="programada" ${t.programada?'checked':''}/><span>Programada</span></label>
-
-      <div class="alarm-field">
-        <label class="main-lab"><input type="checkbox" name="recordatorio" id="chk-alarm" ${recOn?'checked':''}/> ${icon('bell','sm')} Alarma / recordatorio</label>
-        <div class="alarm-opts" id="alarm-opts" ${recOn?'':'hidden'}>${alarmRadios}</div>
-        ${NOTIF_PERM!=='granted'?`<div class="perm-banner" id="perm-banner">${icon('bell')}<div>Para que suene la alarma necesitas permitir notificaciones.</div><button type="button" id="btn-perm">Permitir</button></div>`:''}
-      </div>
-
+      <div class="field"><label>Recurrencia</label><select name="recurrencia">${opciones(REC_LABEL, t.recurrencia)}</select>
+        <small class="hint" id="rec-hint" hidden>La repetición la define la alarma (días elegidos abajo).</small></div>
+      <label class="check-line"><input type="checkbox" name="programada" ${t.programada ? 'checked' : ''}/><span>Programada</span></label>
+      ${alarmFieldHTML(t)}
       <div class="field"><label>Notas</label><textarea name="notas" maxlength="1000">${esc(t.notas)}</textarea></div>
     </div>
     <div class="form-footer">
-      ${ex?`<button type="button" class="btn danger" data-eliminar>${icon('trash','sm')}Eliminar</button>`:''}
+      ${ex ? `<button type="button" class="btn danger" data-eliminar>${icon('trash', 'sm')}Eliminar</button>` : ''}
       <button type="button" class="btn ghost" data-cerrar>Cancelar</button>
-      <button type="submit" class="btn primary">${ex?'Guardar':'Crear'}</button>
+      <button type="submit" class="btn primary">${ex ? 'Guardar' : 'Crear'}</button>
     </div>
   </form>`);
-  const form=$('#form-tarea');
-  form.querySelectorAll('[data-cerrar]').forEach(b=>b.addEventListener('click',cerrarModal));
-  const chk=$('#chk-alarm'), opts=$('#alarm-opts');
-  if(chk) chk.addEventListener('change',()=>{ if(opts) opts.hidden=!chk.checked; });
-  const btnPerm=$('#btn-perm');
-  if(btnPerm) btnPerm.addEventListener('click',async()=>{
-    const ok=await pedirPermisoNotif();
-    if(ok){ const b=$('#perm-banner'); if(b) b.remove(); }
-  });
-  form.addEventListener('submit',async e=>{
+  const form = $('#form-tarea');
+  form.querySelectorAll('[data-cerrar]').forEach(b => b.addEventListener('click', cerrarModal));
+  const af = wireAlarmField(form, diasArr(t));
+  form.addEventListener('submit', async e => {
     e.preventDefault();
-    const data=Object.fromEntries(new FormData(form));
-    data.programada=form.elements.programada.checked;
-    data.recordatorio=!!(form.elements.recordatorio && form.elements.recordatorio.checked);
-    data.recordatorio_min = data.recordatorio ? (parseInt(data.rec_min,10)||0) : 0;
+    const data = Object.fromEntries(new FormData(form));
+    data.programada = form.elements.programada.checked;
+    Object.assign(data, af.read());
     delete data.rec_min;
-    if(data.recordatorio && NOTIF_PERM!=='granted'){
-      const ok=await pedirPermisoNotif();
-      if(!ok) data.recordatorio=false;
-    }
+    if (data.alarma_dias) data.recurrencia = 'unica';
+    else if (!data.recurrencia) data.recurrencia = (ex && ex.recurrencia) || 'unica';
+    if (data.recordatorio && NOTIF_PERM === 'default') await pedirPermisoNotif();
     cerrarModal();
-    act(ex?'updateTarea':'addTarea', ex?{...data,id:ex.id}:data, data.recordatorio?'Guardado · Alarma programada':'Creada',
-      ex?()=>Object.assign(ex,data):()=>DB.tareas.push({id:'tmp_'+Date.now(),estado:'pendiente',...data}));
+    act(ex ? 'updateTarea' : 'addTarea', ex ? { ...data, id: ex.id } : data, data.recordatorio ? 'Guardado · Alarma programada en Calendar' : (ex ? 'Guardada' : 'Creada'),
+      ex ? () => Object.assign(ex, data) : () => DB.tareas.push({ id: 'tmp_' + Date.now(), estado: 'pendiente', ...data }));
   });
-  const del=form.querySelector('[data-eliminar]');
-  if(del) del.addEventListener('click',()=>{if(confirm('¿Eliminar?')){cerrarModal();act('deleteTarea',{id:ex.id},'Eliminada',()=>{DB.tareas=DB.tareas.filter(x=>x!==ex); scheduleAllAlarms()})}});
+  const del = form.querySelector('[data-eliminar]');
+  if (del) del.addEventListener('click', () => { if (confirm('¿Eliminar?')) { cerrarModal(); act('deleteTarea', { id: ex.id }, 'Eliminada', () => { DB.tareas = DB.tareas.filter(x => x !== ex); }); } });
 }
 
 function formNota(id) {
-  const ex=id?DB.notas.find(x=>String(x.id)===String(id)):null;
-  const n=ex||{texto:'',fecha:today(),hora:'',recordatorio:false,recordatorio_min:0};
-  const recOn = hasAlarm(n);
-  const recMin = alarmMin(n);
-  const alarmRadios = ALARM_OPTS.map(o =>
-    `<label><input type="radio" name="rec_min" value="${o.v}" ${recOn && recMin===o.v?'checked':''}/>${o.l}</label>`
-  ).join('');
+  const ex = id ? DB.notas.find(x => String(x.id) === String(id)) : null;
+  const n = ex || { texto: '', fecha: today(), hora: '', recordatorio: false, recordatorio_min: 0, alarma_dias: '' };
   abrirModal(`<form id="form-nota">
-    <div class="form-header"><div><p style="font-size:11px;color:var(--muted);font-weight:800;text-transform:uppercase">${ex?'Editar':'Nueva'}</p><h2>${ex?'Editar':'Nueva'} nota</h2></div><button type="button" class="icon-btn" data-cerrar>${icon('x')}</button></div>
+    <div class="form-header"><div><p style="font-size:11px;color:var(--muted);font-weight:800;text-transform:uppercase">${ex ? 'Editar' : 'Nueva'}</p><h2>${ex ? 'Editar' : 'Nueva'} nota</h2></div><button type="button" class="icon-btn" data-cerrar>${icon('x')}</button></div>
     <div class="form-body">
       <div class="row-2">
         <div class="field"><label>Fecha</label><input name="fecha" type="date" required value="${esc(n.fecha)}"/></div>
-        <div class="field"><label>Hora (opc.)</label><input name="hora" type="time" value="${esc(n.hora||'')}"/></div>
+        <div class="field"><label>Hora (opc.)</label><input name="hora" type="time" value="${esc(n.hora || '')}"/></div>
       </div>
       <div class="field"><label>Nota</label><textarea name="texto" required maxlength="2000" autofocus>${esc(n.texto)}</textarea></div>
-
-      <div class="alarm-field">
-        <label class="main-lab"><input type="checkbox" name="recordatorio" id="chk-alarm-n" ${recOn?'checked':''}/> ${icon('bell','sm')} Recordatorio (opcional)</label>
-        <div class="alarm-opts" id="alarm-opts-n" ${recOn?'':'hidden'}>${alarmRadios}</div>
-        ${NOTIF_PERM!=='granted'?`<div class="perm-banner" id="perm-banner-n">${icon('bell')}<div>Para que suene el recordatorio permite notificaciones.</div><button type="button" id="btn-perm-n">Permitir</button></div>`:''}
-      </div>
+      ${alarmFieldHTML(n)}
     </div>
     <div class="form-footer">
-      ${ex?`<button type="button" class="btn danger" data-eliminar>${icon('trash','sm')}Eliminar</button>`:''}
+      ${ex ? `<button type="button" class="btn danger" data-eliminar>${icon('trash', 'sm')}Eliminar</button>` : ''}
       <button type="button" class="btn ghost" data-cerrar>Cancelar</button>
-      <button type="submit" class="btn primary">${ex?'Guardar':'Crear'}</button>
+      <button type="submit" class="btn primary">${ex ? 'Guardar' : 'Crear'}</button>
     </div>
   </form>`);
-  const form=$('#form-nota');
-  form.querySelectorAll('[data-cerrar]').forEach(b=>b.addEventListener('click',cerrarModal));
-  const chk=$('#chk-alarm-n'), opts=$('#alarm-opts-n');
-  if(chk) chk.addEventListener('change',()=>{ if(opts) opts.hidden=!chk.checked; });
-  const btnPerm=$('#btn-perm-n');
-  if(btnPerm) btnPerm.addEventListener('click',async()=>{
-    const ok=await pedirPermisoNotif();
-    if(ok){ const b=$('#perm-banner-n'); if(b) b.remove(); }
-  });
-  form.addEventListener('submit',async e=>{
+  const form = $('#form-nota');
+  form.querySelectorAll('[data-cerrar]').forEach(b => b.addEventListener('click', cerrarModal));
+  const af = wireAlarmField(form, diasArr(n));
+  form.addEventListener('submit', async e => {
     e.preventDefault();
-    const data=Object.fromEntries(new FormData(form));
-    data.recordatorio=!!(form.elements.recordatorio && form.elements.recordatorio.checked);
-    data.recordatorio_min = data.recordatorio ? (parseInt(data.rec_min,10)||0) : 0;
+    const data = Object.fromEntries(new FormData(form));
+    Object.assign(data, af.read());
     delete data.rec_min;
-    if(data.recordatorio && NOTIF_PERM!=='granted'){
-      const ok=await pedirPermisoNotif();
-      if(!ok) data.recordatorio=false;
-    }
+    if (data.recordatorio && NOTIF_PERM === 'default') await pedirPermisoNotif();
     cerrarModal();
-    act(ex?'updateNota':'addNota', ex?{...data,id:ex.id}:data, data.recordatorio?'Guardado · Recordatorio':'Creada',
-      ex?()=>Object.assign(ex,data):()=>DB.notas.push({id:'tmp_'+Date.now(),...data}));
+    act(ex ? 'updateNota' : 'addNota', ex ? { ...data, id: ex.id } : data, data.recordatorio ? 'Guardado · Alarma programada en Calendar' : (ex ? 'Guardada' : 'Creada'),
+      ex ? () => Object.assign(ex, data) : () => DB.notas.push({ id: 'tmp_' + Date.now(), ...data }));
   });
-  const del=form.querySelector('[data-eliminar]');
-  if(del) del.addEventListener('click',()=>{if(confirm('¿Eliminar?')){cerrarModal();act('deleteNota',{id:ex.id},'Eliminada',()=>{DB.notas=DB.notas.filter(x=>x!==ex); scheduleAllAlarms()})}});
+  const del = form.querySelector('[data-eliminar]');
+  if (del) del.addEventListener('click', () => { if (confirm('¿Eliminar?')) { cerrarModal(); act('deleteNota', { id: ex.id }, 'Eliminada', () => { DB.notas = DB.notas.filter(x => x !== ex); }); } });
 }
 
 function aplicarTema() {
@@ -750,34 +1056,38 @@ function wireInstall() {
 }
 
 function wireGlobal() {
-  $$('#bottom-nav button').forEach(b=>b.addEventListener('click',()=>go(b.dataset.view)));
-  $('#fab').addEventListener('click',()=>VIEW==='notas'?formNota():formTarea());
-  $('#btn-theme').addEventListener('click',toggleTema);
-  document.addEventListener('keydown',e=>{if(e.key==='Escape')cerrarModal()});
-  const setOff=()=>{const o=$('#offline'); if(o) o.hidden=navigator.onLine};
-  window.addEventListener('online',()=>{setOff();refrescar()}); window.addEventListener('offline',setOff); setOff();
-  if('serviceWorker'in navigator){
-    const habia=!!navigator.serviceWorker.controller; let recargado=false;
-    navigator.serviceWorker.addEventListener('controllerchange',()=>{ if(habia&&!recargado){recargado=true;location.reload()} });
+  $$('#bottom-nav button').forEach(b => b.addEventListener('click', () => go(b.dataset.view)));
+  $('#fab').addEventListener('click', () => VIEW === 'notas' ? formNota() : formTarea());
+  $('#btn-theme').addEventListener('click', toggleTema);
+  const ba = $('#btn-alarm'); if (ba) ba.addEventListener('click', abrirPanelAlarmas);
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') cerrarModal(); });
+  // Desbloquea el audio con el primer toque (los navegadores lo exigen)
+  ['pointerdown', 'touchstart', 'click', 'keydown'].forEach(ev => document.addEventListener(ev, unlockAudio, { passive: true }));
+  const setOff = () => { const o = $('#offline'); if (o) o.hidden = navigator.onLine; };
+  window.addEventListener('online', () => { setOff(); refrescar(); }); window.addEventListener('offline', setOff); setOff();
+  if ('serviceWorker' in navigator) {
+    const habia = !!navigator.serviceWorker.controller; let recargado = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => { if (habia && !recargado && !RING_CUR) { recargado = true; location.reload(); } });
     navigator.serviceWorker.addEventListener('message', handleSWMessage);
     window.addEventListener('load', () => {
       navigator.serviceWorker.register('/sw.js', { scope: '/' })
-        .then(reg => { console.log('[SW] registrado', reg.scope); })
+        .then(reg => { reg.update().catch(() => {}); })
         .catch(err => { console.warn('[SW] error', err); });
     });
   }
-  // Reprogramar alarmas al volver a la app (Android)
-  document.addEventListener('visibilitychange',()=>{
-    if(document.visibilityState==='visible') scheduleAllAlarms();
+  // Al volver a la app: revisar alarmas y avisar de las que sonaron mientras estaba cerrada
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') { tick(); if (DB.loaded) catchUp(); }
   });
-  window.addEventListener('focus',()=>scheduleAllAlarms());
+  window.addEventListener('focus', () => tick());
+  setInterval(tick, 10000);
 }
 
 function init() {
   aplicarTema(); wireGlobal(); wireInstall(); render(); load();
-  if(typeof Notification!=='undefined') NOTIF_PERM=Notification.permission;
-  window.matchMedia('(prefers-color-scheme:dark)').addEventListener?.('change',()=>{
-    if((localStorage.getItem('mi_agenda_theme')||'auto')==='auto') actualizarIconoTema('auto');
+  if (typeof Notification !== 'undefined') NOTIF_PERM = Notification.permission;
+  window.matchMedia('(prefers-color-scheme:dark)').addEventListener?.('change', () => {
+    if ((localStorage.getItem('mi_agenda_theme') || 'auto') === 'auto') actualizarIconoTema('auto');
   });
 }
-if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',init); else init();
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
