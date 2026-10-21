@@ -1,4 +1,5 @@
-const CACHE = 'mi-agenda-v6';
+/* Mi Agenda v4.0.0 — Service Worker */
+const CACHE = 'mi-agenda-v7';
 const CORE = [
   '/',
   '/index.html',
@@ -26,6 +27,7 @@ self.addEventListener('activate', e => {
   self.clients.claim();
 });
 
+// Red primero (siempre la última versión); caché solo si no hay conexión
 self.addEventListener('fetch', e => {
   const req = e.request;
   const url = new URL(req.url);
@@ -46,35 +48,23 @@ self.addEventListener('fetch', e => {
   );
 });
 
+function avisarCliente(tipo, data, urlParam) {
+  return self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+    if (clients.length) {
+      clients[0].postMessage({ type: tipo, id: data.id, kind: data.kind || 'tarea' });
+      return clients[0].focus();
+    }
+    return self.clients.openWindow('/?' + urlParam + '=' + encodeURIComponent(data.id || '') +
+      '&kind=' + encodeURIComponent(data.kind || 'tarea'));
+  });
+}
+
 self.addEventListener('notificationclick', e => {
   const data = e.notification.data || {};
   e.notification.close();
 
-  if (e.action === 'snooze') {
-    e.waitUntil(
-      self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
-        if (clients.length) {
-          clients[0].postMessage({ type: 'SNOOZE_ALARM', id: data.id, kind: data.kind || 'tarea' });
-          return clients[0].focus();
-        }
-        return self.clients.openWindow('/?alarm=' + encodeURIComponent(data.id || ''));
-      })
-    );
-    return;
-  }
-
-  if (e.action === 'done') {
-    e.waitUntil(
-      self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
-        if (clients.length) {
-          clients[0].postMessage({ type: 'DONE_ALARM', id: data.id, kind: data.kind || 'tarea' });
-          return clients[0].focus();
-        }
-        return self.clients.openWindow('/?done=' + encodeURIComponent(data.id || ''));
-      })
-    );
-    return;
-  }
+  if (e.action === 'snooze') { e.waitUntil(avisarCliente('SNOOZE_ALARM', data, 'snooze')); return; }
+  if (e.action === 'done')   { e.waitUntil(avisarCliente('DONE_ALARM', data, 'done')); return; }
 
   e.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
@@ -84,6 +74,7 @@ self.addEventListener('notificationclick', e => {
   );
 });
 
+// Compatibilidad: la página también puede pedir la notificación por mensaje
 self.addEventListener('message', e => {
   if (!e.data || e.data.type !== 'SHOW_ALARM') return;
   const d = e.data;
@@ -96,7 +87,6 @@ self.addEventListener('message', e => {
       renotify: true,
       requireInteraction: true,
       vibrate: [300, 120, 300, 120, 300, 120, 500],
-      silent: false,
       data: { id: d.id, kind: d.kind || 'tarea' },
       actions: [
         { action: 'done', title: '✓ Hecha' },
