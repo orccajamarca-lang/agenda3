@@ -28,8 +28,9 @@
     .logo{width:40px;height:40px;border-radius:10px;background:var(--orange);display:flex;align-items:center;justify-content:center;font-weight:900;font-size:16px;color:#fff}
     header h1{font-size:18px;font-weight:700;line-height:1.2}
     header small{font-size:12px;opacity:.75;display:block;text-transform:capitalize}
-    .hbtn{margin-left:auto;height:38px;min-width:38px;padding:0 10px;border-radius:12px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.1);color:#fff;font-size:18px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:6px;cursor:pointer}
-    .hbtn+.hbtn{margin-left:0}
+    .hbtn{position:relative;height:38px;min-width:38px;padding:0 10px;border-radius:12px;border:1px solid rgba(255,255,255,.25);background:rgba(255,255,255,.1);color:#fff;font-size:18px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:6px;cursor:pointer}
+    header>div:nth-of-type(2){flex:1;min-width:0}
+    .hbtn .badge{position:absolute;top:-4px;right:-4px;width:12px;height:12px;border-radius:50%;background:var(--danger);border:2px solid var(--navy)}
     #btn-install{font-size:13px;background:var(--orange);border-color:var(--orange)}
     #offline{background:var(--warn);color:#1f1300;text-align:center;font-size:13px;font-weight:700;padding:6px}
 
@@ -120,6 +121,45 @@
     .btn.primary{background:var(--orange);color:#fff}.btn.ghost{background:var(--soft);color:var(--ink)}.btn.danger{background:rgba(239,68,68,.15);color:var(--danger);margin-right:auto}
     .howto{padding:0 20px 8px;font-size:14px;line-height:1.6}.howto li{margin-left:18px;margin-bottom:6px}
 
+
+    /* ---- v4: alarma estilo Notion ---- */
+    .af-sub{font-size:11px;font-weight:800;text-transform:uppercase;color:var(--muted);margin:12px 0 6px}
+    .seg{display:flex;flex-wrap:wrap;gap:6px}
+    .seg button{padding:7px 12px;border-radius:999px;border:1.5px solid var(--line);background:var(--card);font-size:13px;font-weight:600;cursor:pointer}
+    .seg button[aria-pressed=true]{background:var(--orange);border-color:var(--orange);color:#fff}
+    .dow{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-top:10px}
+    .dow-btn{aspect-ratio:1;border-radius:50%;border:1.5px solid var(--line);background:var(--card);font-weight:800;font-size:14px;cursor:pointer}
+    .dow-btn[aria-pressed=true]{background:var(--navy);border-color:var(--navy);color:#fff}
+    :root[data-theme=dark] .dow-btn[aria-pressed=true]{background:var(--orange);border-color:var(--orange)}
+    .af-sum{margin-top:12px;font-size:13px;font-weight:600;color:var(--orange)}
+    .hint{display:block;margin-top:4px;font-size:12px;color:var(--muted)}
+    .btn.block{width:100%;justify-content:center;margin-bottom:10px}
+    .panel-note{font-size:13px;line-height:1.5;margin-bottom:14px;color:var(--muted)}
+    .panel-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+    .panel-row span{display:block;font-size:12px;color:var(--muted)}
+    .chip-btn{padding:6px 12px;border-radius:8px;border:none;background:var(--orange);color:#fff;font-weight:700;font-size:12px;cursor:pointer}
+    .sep{border:none;border-top:1px solid var(--line);margin:14px 0}
+    .panel-list{margin:14px 0}
+    .panel-list h3{font-size:13px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
+    .panel-list div{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:6px 0;border-bottom:1px solid var(--line)}
+    .panel-list small{color:var(--muted);white-space:nowrap}
+    .panel-list em{font-style:normal;font-size:11px;color:var(--orange);font-weight:700}
+    .tips{margin-top:12px;font-size:13px;line-height:1.5}
+    .tips summary{cursor:pointer;font-weight:700}
+    .tips ol{padding-left:18px;margin:8px 0}
+    #alarm-ring{position:fixed;inset:0;z-index:200;background:rgba(10,31,68,.96);display:flex;align-items:center;justify-content:center;padding:20px}
+    #alarm-ring[hidden]{display:none}
+    .ring-card{width:100%;max-width:380px;text-align:center;color:#fff}
+    .ring-card small{display:block;opacity:.8;font-weight:700;margin:6px 0}
+    .ring-card h2{font-size:24px;margin:10px 0;overflow-wrap:anywhere}
+    .ring-card p{opacity:.85;margin-bottom:10px}
+    .ring-bell{width:84px;height:84px;margin:0 auto 10px;border-radius:50%;background:var(--orange);display:flex;align-items:center;justify-content:center;font-size:40px;animation:ring 1s infinite}
+    #ring-warn{background:rgba(245,158,11,.2);border:1px solid var(--warn);border-radius:10px;padding:8px;font-size:13px;margin:10px 0}
+    .ring-actions{display:flex;flex-direction:column;gap:10px;margin-top:20px}
+    .ring-actions .btn{justify-content:center;padding:14px;font-size:16px}
+    @keyframes ring{0%,100%{transform:rotate(0)}15%{transform:rotate(14deg)}30%{transform:rotate(-12deg)}45%{transform:rotate(10deg)}60%{transform:rotate(-8deg)}75%{transform:rotate(0)}}
+    @media(prefers-reduced-motion:reduce){.ring-bell{animation:none}}
+
     #toast{position:fixed;top:calc(16px + env(safe-area-inset-top));left:50%;transform:translateX(-50%) translateY(-120px);background:var(--navy);color:#fff;padding:12px 22px;border-radius:12px;font-size:14px;font-weight:600;z-index:100;transition:.3s;opacity:0;max-width:90vw;text-align:center;pointer-events:none}
     #toast.show{transform:translateX(-50%) translateY(0);opacity:1}
     #toast.error{background:var(--danger)}
@@ -151,6 +191,7 @@
     <div class="logo">MA</div>
     <div><h1>Mi Agenda</h1><small id="today-label">Cargando…</small></div>
     <button id="btn-install" class="hbtn" hidden>Instalar</button>
+    <button id="btn-alarm" class="hbtn" aria-label="Centro de alarmas"><svg class="i sm"><use href="#i-bell"/></svg><span class="badge" hidden></span></button>
     <button id="btn-theme" class="hbtn" aria-label="Cambiar tema"><svg class="i sm"><use href="#i-moon"/></svg></button>
   </header>
   <div id="offline" hidden>Sin conexión — mostrando datos guardados</div>
